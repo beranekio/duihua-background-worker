@@ -1,0 +1,6 @@
+target
+.git
+charts
+**/*.rs.bk
+**/*.md
+!README.md

@@ -1,0 +1,57 @@
+{{- if eq (include "duihua-background-worker.autoscaling.enabled" .) "true" }}
+{{- $autoscaling := .Values.autoscaling }}
+{{- $workerName := include "duihua-background-worker.fullname" . }}
+{{- $driver := include "duihua-background-worker.autoscaling.driver" . }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $workerName }}
+  labels:
+    {{- include "duihua-background-worker.labels" . | nindent 4 }}
+  {{- with $autoscaling.scaledObjectAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    name: {{ $workerName }}
+    kind: Deployment
+    apiVersion: apps/v1
+  minReplicaCount: {{ include "duihua-background-worker.autoscaling.minReplicas" . }}
+  maxReplicaCount: {{ include "duihua-background-worker.autoscaling.maxReplicas" . }}
+  cooldownPeriod: {{ include "duihua-background-worker.autoscaling.scaledownPeriod" . }}
+  {{- with $autoscaling.pollingInterval }}
+  pollingInterval: {{ . }}
+  {{- end }}
+  triggers:
+    {{- if eq $driver "store-metrics" }}
+    - type: metrics-api
+      metadata:
+        url: {{ include "duihua-background-worker.autoscaling.metricsUrl" . | quote }}
+        format: "json"
+        valueLocation: "workload"
+        targetValue: {{ include "duihua-background-worker.autoscaling.jobsPerReplica" . | quote }}
+        activationTargetValue: {{ include "duihua-background-worker.autoscaling.activationTargetValue" . | quote }}
+    {{- else if eq $driver "redis-streams" }}
+    {{- $valkey := $autoscaling.valkey | default dict }}
+    - type: redis-streams
+      metadata:
+        address: {{ include "duihua-background-worker.valkey.address" . | quote }}
+        stream: {{ include "duihua-background-worker.valkey.streamKey" . | quote }}
+        consumerGroup: {{ .Values.consumerGroup | quote }}
+        lagCount: {{ include "duihua-background-worker.autoscaling.jobsPerReplica" . | quote }}
+        activationLagCount: {{ include "duihua-background-worker.autoscaling.activationLagCount" . | quote }}
+        {{- if $valkey.enableTLS }}
+        enableTLS: "true"
+        {{- end }}
+        {{- $databaseIndex := $valkey.databaseIndex | default 0 -}}
+        {{- if ne ($databaseIndex | int) 0 }}
+        databaseIndex: {{ $databaseIndex | quote }}
+        {{- end }}
+        {{- with $valkey.passwordFromEnv }}
+        passwordFromEnv: {{ . | quote }}
+        {{- end }}
+    {{- else }}
+    {{- fail (printf "autoscaling.driver must be store-metrics or redis-streams, got %q" $driver) }}
+    {{- end }}
+{{- end }}

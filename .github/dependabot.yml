@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      tonic-ecosystem:
+        patterns:
+          - "prost"
+          - "prost-types"
+          - "tonic"
+          - "tonic-build"
+          - "tonic-prost"
+          - "tonic-prost-build"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
