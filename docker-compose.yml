@@ -1,0 +1,48 @@
+services:
+  duihua-background-worker:
+    build: .
+    environment:
+      RESPONSES_API_STORE_ENDPOINT: http://responses-api-store:50051
+      RESPONSE_ID_STORE_TTL_SECONDS: "86400"
+      BACKGROUND_QUEUE_CONSUMER_GROUP: duihua-background
+      BACKGROUND_UPSTREAM_TIMEOUT_SECONDS: "600"
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      responses-api-store:
+        condition: service_healthy
+
+  responses-api-store:
+    image: ghcr.io/beranekio/responses-api-store:latest
+    environment:
+      GRPC_LISTEN_ADDR: 0.0.0.0:50051
+      RESPONSE_ID_STORE_URL: redis://valkey:6379
+      RESPONSE_ID_STORE_KEY_PREFIX: responses-api-store:responses
+      RESPONSE_ID_STORE_TTL_SECONDS: "86400"
+      BACKGROUND_QUEUE_STREAM_KEY: responses-api-store:background
+      BACKGROUND_RESPONSE_STALE_SECONDS: "3600"
+    ports:
+      - "50051:50051"
+    healthcheck:
+      test: ["CMD", "/responses-api-store-probe"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+  valkey:
+    image: valkey/valkey:9.1.0-alpine
+    command:
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

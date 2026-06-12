@@ -1,0 +1,115 @@
+name: Publish
+
+on:
+  workflow_run:
+    workflows: ["Validate"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+jobs:
+  publish-image:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: duihua-background-worker-ci-image
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Load image
+        run: docker load -i duihua-background-worker-ci.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          GIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          docker tag duihua-background-worker:ci "${IMAGE}:${GIT_SHA}"
+          docker push "${IMAGE}:${GIT_SHA}"
+
+          git fetch origin main
+          main_sha="$(git rev-parse origin/main)"
+          if [ "${GIT_SHA}" = "${main_sha}" ]; then
+            docker tag duihua-background-worker:ci "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          else
+            echo "Skipping latest tag: ${GIT_SHA} is no longer main head (${main_sha})"
+          fi
+
+  publish-chart:
+    name: Publish Helm chart
+    runs-on: ubuntu-latest
+    needs: publish-image
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and push chart tags
+        env:
+          CHART_NAME: duihua-background-worker
+          CHART_PATH: charts/duihua-background-worker
+          CHART_OCI_PREFIX: oci://ghcr.io/${{ github.repository_owner }}/charts
+          IMAGE: ghcr.io/${{ github.repository }}
+          GIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          chart_staging="$(mktemp -d)"
+          cp -r "${CHART_PATH}" "${chart_staging}/${CHART_NAME}"
+          yq -i \
+            ".image.repository = \"${IMAGE}\" | .image.tag = \"${GIT_SHA}\"" \
+            "${chart_staging}/${CHART_NAME}/values.yaml"
+
+          chart_version="0.0.0-${GIT_SHA}"
+          chart_package="$(
+            helm package "${chart_staging}/${CHART_NAME}" \
+              --version "${chart_version}" \
+              --app-version "${GIT_SHA}" \
+              | awk '{print $NF}'
+          )"
+
+          helm push "${chart_package}" "${CHART_OCI_PREFIX}"
+          echo "Published oci://${CHART_OCI_PREFIX#oci://}/${CHART_NAME}:${chart_version}"

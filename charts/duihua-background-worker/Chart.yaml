@@ -1,0 +1,12 @@
+apiVersion: v2
+name: duihua-background-worker
+description: Background worker for async OpenAI Responses API jobs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - openai
+  - responses
+  - background
+maintainers:
+  - name: beranekio

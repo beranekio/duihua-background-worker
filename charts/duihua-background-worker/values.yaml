@@ -1,0 +1,76 @@
+# Deploy the worker. Parent charts typically gate this alongside gateway store settings.
+enabled: true
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/beranekio/duihua-background-worker
+  tag: "latest"
+  pullPolicy: Always
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+responsesApiStore:
+  # gRPC endpoint for responses-api-store (http://host:port). Required when enabled=true.
+  endpoint: ""
+  responseIdStoreTtlSeconds: "86400"
+
+consumerGroup: duihua-background
+
+# Keep below the responses-api-store Valkey client response timeout (500ms).
+blockMs: 400
+pendingRetrySeconds: 30
+# Maximum simultaneous upstream calls per worker pod.
+maxConcurrentJobs: 1
+# SIGTERM grace for rollout drain; should exceed upstream timeout + blockMs + margin.
+terminationGracePeriodSeconds: 665
+upstreamTimeoutSeconds: "600"
+
+# Optional bearer token forwarded to upstream inference when jobs omit per-request auth.
+upstreamApiKey: ""
+
+autoscaling:
+  # Scale the worker Deployment via KEDA (no HTTP add-on needed).
+  # driver store-metrics: queries responses-api-store GET /metrics/background-queue (default).
+  # driver redis-streams: legacy Valkey stream lag scaler (deprecated).
+  enabled: false
+  driver: store-metrics
+  # Threshold aliases; prefer jobsPerReplica / activationTargetValue for store-metrics.
+  lagCount: 5
+  activationLagCount: 0
+  # Required when driver=store-metrics unless parent chart wires a default Service URL.
+  metricsUrl: ""
+  scaledownPeriod: 300
+  pollingInterval: 15
+  # redis-streams driver only: direct Valkey connection settings.
+  valkey:
+    address: ""
+    enableTLS: false
+    passwordFromEnv: ""
+    databaseIndex: 0
+    streamKey: responses-api-store:background
+  replicas:
+    min: 1
+    max: 4
+  scaledObjectAnnotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

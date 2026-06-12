@@ -1,0 +1,20 @@
+[package]
+name = "duihua-background-worker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/beranekio/duihua-background-worker"
+description = "Background worker for async OpenAI Responses API jobs"
+
+[[bin]]
+name = "duihua-background-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
+responses-api-store-client = { git = "https://github.com/beranekio/responses-api-store", branch = "main" }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.14"
