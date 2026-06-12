@@ -40,8 +40,16 @@ pub struct ProcessContext {
     pub entry_source: EntrySource,
 }
 
+pub fn upstream_http_client() -> Result<HttpClient> {
+    HttpClient::builder()
+        .timeout(upstream_timeout_from_env())
+        .build()
+        .context("failed to build upstream HTTP client")
+}
+
 pub async fn process_response(
     response_store: &StoreHandle,
+    http: &HttpClient,
     response_id: &str,
     ctx: ProcessContext,
 ) -> Result<ProcessOutcome> {
@@ -69,7 +77,6 @@ pub async fn process_response(
         return outcome_after_failed_claim(response_store, response_id, ctx).await;
     };
 
-    let http = upstream_http_client()?;
     let url = format!("{}/responses", work.upstream);
     let mut req = http.post(&url).json(&work.upstream_request);
     if let Some(authorization) = work.upstream_authorization.as_deref() {
@@ -242,13 +249,6 @@ async fn claim_for_processing(
 
 fn is_claimable(stored: &StoredResponse) -> bool {
     should_persist(stored) && stored.pending_upstream_request.is_some()
-}
-
-fn upstream_http_client() -> Result<HttpClient> {
-    HttpClient::builder()
-        .timeout(upstream_timeout_from_env())
-        .build()
-        .context("failed to build upstream HTTP client")
 }
 
 fn enrich_upstream_completion_response(

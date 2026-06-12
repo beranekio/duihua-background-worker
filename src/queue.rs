@@ -13,6 +13,7 @@ use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::worker::{self, EntrySource, ProcessContext, ProcessOutcome};
+use reqwest::Client as HttpClient;
 
 const ENSURE_CONSUMER_GROUP_ATTEMPTS: usize = 30;
 const ENSURE_CONSUMER_GROUP_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -99,17 +100,21 @@ pub async fn run() -> Result<()> {
         recommended_termination_grace_period_seconds_for_config(&config)
     );
 
+    let upstream_http = worker::upstream_http_client()?;
     let job_concurrency = Arc::new(Semaphore::new(config.max_concurrent_jobs));
+    let pending_retries = Arc::new(Mutex::new(PendingRetryScheduler::new()));
+    let mut join_set = JoinSet::new();
+
     drain_pending_at_startup(
         &config,
         &response_store,
+        &upstream_http,
         job_concurrency.clone(),
+        pending_retries.clone(),
+        &mut join_set,
         &shutdown_rx,
     )
     .await;
-
-    let pending_retries = Arc::new(Mutex::new(PendingRetryScheduler::new()));
-    let mut join_set = JoinSet::new();
 
     loop {
         if shutdown_triggered(&shutdown_rx) {
@@ -122,8 +127,10 @@ pub async fn run() -> Result<()> {
             process_due_pending_retries(
                 &config,
                 &response_store,
+                &upstream_http,
                 pending_retries.clone(),
                 job_concurrency.clone(),
+                &mut join_set,
                 &shutdown_rx,
             )
             .await;
@@ -142,17 +149,19 @@ pub async fn run() -> Result<()> {
             break;
         }
 
-        match claim_jobs(&response_store, &config, 1).await {
+        match claim_jobs(&response_store, &config, 1, config.block_ms as u32).await {
             Ok(Some(message)) => {
                 process_message(
                     &config,
                     &response_store,
+                    &upstream_http,
                     message,
                     pending_retries.clone(),
                     job_concurrency.clone(),
                     &mut join_set,
                     &shutdown_rx,
                     Some(permit),
+                    None,
                 )
                 .await;
             }
@@ -175,13 +184,14 @@ async fn claim_jobs(
     response_store: &StoreHandle,
     config: &QueueConfig,
     count: u32,
+    block_ms: u32,
 ) -> Result<Option<QueueMessage>> {
     let result = response_store
         .claim_background_jobs(ClaimBackgroundJobsRequest {
             consumer_group: config.consumer_group.clone(),
             consumer_name: config.consumer_name.clone(),
             count,
-            block_ms: config.block_ms as u32,
+            block_ms,
             autoclaim_min_idle_ms: config.autoclaim_min_idle_ms as u32,
         })
         .await?;
@@ -211,7 +221,10 @@ fn entry_source_for_message(message: &QueueMessage, startup_pending: bool) -> En
 async fn drain_pending_at_startup(
     config: &QueueConfig,
     response_store: &StoreHandle,
+    upstream_http: &HttpClient,
     job_concurrency: Arc<Semaphore>,
+    pending_retries: Arc<Mutex<PendingRetryScheduler>>,
+    join_set: &mut JoinSet<()>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     loop {
@@ -219,41 +232,34 @@ async fn drain_pending_at_startup(
             break;
         }
 
-        let Some(permit) = acquire_job_permit(job_concurrency.clone(), shutdown_rx, true).await
-        else {
-            break;
-        };
-
-        match claim_jobs(response_store, config, 1).await {
+        match claim_jobs(response_store, config, 1, 0).await {
             Ok(Some(message)) => {
-                if let Err(err) = handle_message(
+                let entry_source = entry_source_for_message(&message, message.autoclaimed);
+                process_message(
                     config,
                     response_store,
-                    &message,
-                    entry_source_for_message(&message, true),
+                    upstream_http,
+                    message.clone(),
+                    pending_retries.clone(),
+                    job_concurrency.clone(),
+                    join_set,
+                    shutdown_rx,
+                    None,
+                    Some(entry_source),
                 )
-                .await
-                {
-                    eprintln!(
-                        "failed to process startup pending entry {}: {err:?}",
-                        message.stream_id
-                    );
-                    drop(permit);
+                .await;
+
+                if !message.autoclaimed {
                     break;
                 }
             }
-            Ok(None) => {
-                drop(permit);
-                break;
-            }
+            Ok(None) => break,
             Err(err) => {
-                drop(permit);
                 eprintln!("failed to drain pending background queue messages at startup: {err:?}");
                 sleep_on_store_error().await;
                 break;
             }
         }
-        drop(permit);
     }
 }
 
@@ -309,8 +315,10 @@ impl PendingRetryScheduler {
 async fn process_due_pending_retries(
     config: &QueueConfig,
     response_store: &StoreHandle,
+    upstream_http: &HttpClient,
     pending_retries: Arc<Mutex<PendingRetryScheduler>>,
     job_concurrency: Arc<Semaphore>,
+    join_set: &mut JoinSet<()>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     let due_messages = {
@@ -323,38 +331,20 @@ async fn process_due_pending_retries(
             break;
         }
 
-        let Some(permit) = acquire_job_permit(job_concurrency.clone(), shutdown_rx, true).await
-        else {
-            break;
-        };
-
-        match handle_message(
+        pending_retries.lock().await.remove(&message.stream_id);
+        process_message(
             config,
             response_store,
-            &message,
-            entry_source_for_message(&message, false),
+            upstream_http,
+            message,
+            pending_retries.clone(),
+            job_concurrency.clone(),
+            join_set,
+            shutdown_rx,
+            None,
+            None,
         )
-        .await
-        {
-            Ok(()) => pending_retries.lock().await.remove(&message.stream_id),
-            Err(err) if err.downcast_ref::<RetryableMessageError>().is_some() => {
-                pending_retries
-                    .lock()
-                    .await
-                    .schedule(&message, pending_retry_backoff_from_env());
-            }
-            Err(err) => {
-                eprintln!(
-                    "failed pending retry for background queue message {}: {err:?}",
-                    message.response_id
-                );
-                pending_retries
-                    .lock()
-                    .await
-                    .schedule(&message, pending_retry_backoff_from_env());
-            }
-        }
-        drop(permit);
+        .await;
     }
 }
 
@@ -362,15 +352,17 @@ async fn process_due_pending_retries(
 async fn process_message(
     config: &QueueConfig,
     response_store: &StoreHandle,
+    upstream_http: &HttpClient,
     message: QueueMessage,
     pending_retries: Arc<Mutex<PendingRetryScheduler>>,
     job_concurrency: Arc<Semaphore>,
     join_set: &mut JoinSet<()>,
     shutdown_rx: &watch::Receiver<bool>,
     mut reserved_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    entry_source: Option<EntrySource>,
 ) {
     let response_id = message.response_id.clone();
-    let entry_source = entry_source_for_message(&message, false);
+    let entry_source = entry_source.unwrap_or_else(|| entry_source_for_message(&message, false));
     let permit = match reserved_permit.take() {
         Some(permit) => Some(permit),
         None => acquire_job_permit(job_concurrency.clone(), shutdown_rx, true).await,
@@ -380,7 +372,15 @@ async fn process_message(
     };
 
     if shutdown_triggered(shutdown_rx) {
-        match handle_message(config, response_store, &message, entry_source).await {
+        match handle_message(
+            config,
+            response_store,
+            upstream_http,
+            &message,
+            entry_source,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(err) if err.downcast_ref::<RetryableMessageError>().is_some() => {
                 pending_retries
@@ -398,10 +398,19 @@ async fn process_message(
 
     let config = config.clone();
     let response_store = response_store.clone();
+    let upstream_http = upstream_http.clone();
     let pending_retries = pending_retries.clone();
     join_set.spawn(async move {
         let _permit = permit;
-        match handle_message(&config, &response_store, &message, entry_source).await {
+        match handle_message(
+            &config,
+            &response_store,
+            &upstream_http,
+            &message,
+            entry_source,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(err) if err.downcast_ref::<RetryableMessageError>().is_some() => {
                 pending_retries
@@ -432,6 +441,7 @@ impl std::error::Error for RetryableMessageError {}
 async fn handle_message(
     config: &QueueConfig,
     response_store: &StoreHandle,
+    upstream_http: &HttpClient,
     message: &QueueMessage,
     entry_source: EntrySource,
 ) -> Result<()> {
@@ -440,7 +450,8 @@ async fn handle_message(
         autoclaim_min_idle_ms: config.autoclaim_min_idle_ms,
         entry_source,
     };
-    match worker::process_response(response_store, &message.response_id, ctx).await? {
+    match worker::process_response(response_store, upstream_http, &message.response_id, ctx).await?
+    {
         ProcessOutcome::Ack => {
             response_store
                 .acknowledge_background_job(&config.consumer_group, &message.stream_id)
