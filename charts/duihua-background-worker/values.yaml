@@ -36,7 +36,11 @@ terminationGracePeriodSeconds: 665
 upstreamTimeoutSeconds: "600"
 
 # Optional bearer token forwarded to upstream inference when jobs omit per-request auth.
+# Prefer upstreamApiKeySecret in production; inline upstreamApiKey is for local/kind only.
 upstreamApiKey: ""
+upstreamApiKeySecret:
+  name: ""
+  key: ""
 
 autoscaling:
   # Scale the worker Deployment via KEDA (no HTTP add-on needed).
