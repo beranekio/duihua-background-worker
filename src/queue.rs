@@ -162,6 +162,7 @@ pub async fn run() -> Result<()> {
                     &shutdown_rx,
                     Some(permit),
                     None,
+                    None,
                 )
                 .await;
             }
@@ -246,6 +247,7 @@ async fn drain_pending_at_startup(
                     shutdown_rx,
                     None,
                     Some(entry_source),
+                    None,
                 )
                 .await;
 
@@ -290,12 +292,13 @@ impl PendingRetryScheduler {
         Self::default()
     }
 
-    fn schedule(&mut self, message: &QueueMessage, backoff: Duration, entry_source: EntrySource) {
-        let attempt = self
-            .entries
-            .get(&message.stream_id)
-            .map(|entry| entry.attempt.saturating_add(1))
-            .unwrap_or(1);
+    fn schedule(
+        &mut self,
+        message: &QueueMessage,
+        backoff: Duration,
+        entry_source: EntrySource,
+        attempt: u32,
+    ) {
         self.entries.insert(
             message.stream_id.clone(),
             PendingRetryEntry {
@@ -347,7 +350,13 @@ fn entry_source_for_pending_retry(
 fn max_pending_retry_attempts(autoclaim_min_idle_ms: usize, backoff: Duration) -> u32 {
     let backoff_ms = backoff.as_millis().max(1) as u64;
     let autoclaim_ms = autoclaim_min_idle_ms as u64;
-    (autoclaim_ms / backoff_ms).max(1) as u32
+    autoclaim_ms.div_ceil(backoff_ms).max(1) as u32
+}
+
+fn next_retry_attempt(current: Option<u32>) -> u32 {
+    current
+        .map(|attempt| attempt.saturating_add(1))
+        .unwrap_or(1)
 }
 
 async fn process_due_pending_retries(
@@ -387,6 +396,7 @@ async fn process_due_pending_retries(
             shutdown_rx,
             None,
             Some(entry_source),
+            Some(due_retry.attempt),
         )
         .await;
     }
@@ -404,9 +414,11 @@ async fn process_message(
     shutdown_rx: &watch::Receiver<bool>,
     mut reserved_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     entry_source: Option<EntrySource>,
+    retry_attempt: Option<u32>,
 ) {
     let response_id = message.response_id.clone();
     let entry_source = entry_source.unwrap_or_else(|| entry_source_for_message(&message, false));
+    let next_attempt = next_retry_attempt(retry_attempt);
     let permit = match reserved_permit.take() {
         Some(permit) => Some(permit),
         None => acquire_job_permit(job_concurrency.clone(), shutdown_rx, true).await,
@@ -433,6 +445,7 @@ async fn process_message(
                     &pending_retries,
                     &response_id,
                     entry_source,
+                    next_attempt,
                 )
                 .await
             }
@@ -464,6 +477,7 @@ async fn process_message(
                     &pending_retries,
                     &response_id,
                     entry_source,
+                    next_attempt,
                 )
                 .await;
             }
@@ -479,6 +493,7 @@ async fn schedule_message_retry_on_error(
     pending_retries: &Arc<Mutex<PendingRetryScheduler>>,
     response_id: &str,
     entry_source: EntrySource,
+    attempt: u32,
 ) {
     if err.downcast_ref::<RetryableMessageError>().is_some()
         || err.downcast_ref::<RetryableAckError>().is_some()
@@ -487,6 +502,7 @@ async fn schedule_message_retry_on_error(
             message,
             pending_retry_backoff_from_env(),
             entry_source,
+            attempt,
         );
         return;
     }
@@ -786,7 +802,7 @@ mod tests {
             idle_ms: None,
             autoclaimed: false,
         };
-        scheduler.schedule(&message, Duration::from_secs(60), EntrySource::Live);
+        scheduler.schedule(&message, Duration::from_secs(60), EntrySource::Live, 1);
         assert!(scheduler.due_retries().is_empty());
         scheduler.entries.get_mut("1-0").unwrap().retry_at = Instant::now();
         assert_eq!(
@@ -808,8 +824,8 @@ mod tests {
             idle_ms: None,
             autoclaimed: false,
         };
-        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live);
-        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live);
+        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live, 1);
+        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live, 2);
         let entry = scheduler.entries.get("1-0").unwrap();
         assert_eq!(entry.entry_source, EntrySource::Live);
         assert_eq!(entry.attempt, 2);
@@ -850,5 +866,19 @@ mod tests {
             max_pending_retry_attempts(720_000, Duration::from_secs(30)),
             24
         );
+    }
+
+    #[test]
+    fn max_pending_retry_attempts_uses_ceiling_division() {
+        assert_eq!(
+            max_pending_retry_attempts(45_000, Duration::from_secs(30)),
+            2
+        );
+    }
+
+    #[test]
+    fn next_retry_attempt_increments_from_due_retry() {
+        assert_eq!(next_retry_attempt(None), 1);
+        assert_eq!(next_retry_attempt(Some(3)), 4);
     }
 }
