@@ -95,10 +95,6 @@ fn map_client_error(err: ClientError) -> anyhow::Error {
 }
 
 pub fn is_retryable_store_error(err: &anyhow::Error) -> bool {
-    if let Some(err) = err.downcast_ref::<ClientError>() {
-        return is_retryable_client_error(err);
-    }
-
     for cause in err.chain() {
         if let Some(err) = cause.downcast_ref::<ClientError>() {
             return is_retryable_client_error(err);

@@ -269,6 +269,15 @@ struct PendingRetryEntry {
     retry_at: Instant,
     autoclaimed: bool,
     idle_ms: Option<u64>,
+    entry_source: EntrySource,
+    attempt: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DuePendingRetry {
+    message: QueueMessage,
+    entry_source: EntrySource,
+    attempt: u32,
 }
 
 #[derive(Debug, Default)]
@@ -281,7 +290,12 @@ impl PendingRetryScheduler {
         Self::default()
     }
 
-    fn schedule(&mut self, message: &QueueMessage, backoff: Duration) {
+    fn schedule(&mut self, message: &QueueMessage, backoff: Duration, entry_source: EntrySource) {
+        let attempt = self
+            .entries
+            .get(&message.stream_id)
+            .map(|entry| entry.attempt.saturating_add(1))
+            .unwrap_or(1);
         self.entries.insert(
             message.stream_id.clone(),
             PendingRetryEntry {
@@ -289,6 +303,8 @@ impl PendingRetryScheduler {
                 retry_at: Instant::now() + backoff,
                 autoclaimed: message.autoclaimed,
                 idle_ms: message.idle_ms,
+                entry_source,
+                attempt,
             },
         );
     }
@@ -297,19 +313,41 @@ impl PendingRetryScheduler {
         self.entries.remove(stream_id);
     }
 
-    fn due_messages(&self) -> Vec<QueueMessage> {
+    fn due_retries(&self) -> Vec<DuePendingRetry> {
         let now = Instant::now();
         self.entries
             .iter()
             .filter(|(_, entry)| entry.retry_at <= now)
-            .map(|(stream_id, entry)| QueueMessage {
-                stream_id: stream_id.clone(),
-                response_id: entry.response_id.clone(),
-                idle_ms: entry.idle_ms,
-                autoclaimed: entry.autoclaimed,
+            .map(|(stream_id, entry)| DuePendingRetry {
+                message: QueueMessage {
+                    stream_id: stream_id.clone(),
+                    response_id: entry.response_id.clone(),
+                    idle_ms: entry.idle_ms,
+                    autoclaimed: entry.autoclaimed,
+                },
+                entry_source: entry.entry_source,
+                attempt: entry.attempt,
             })
             .collect()
     }
+}
+
+fn entry_source_for_pending_retry(
+    due: &DuePendingRetry,
+    autoclaim_min_idle_ms: usize,
+    backoff: Duration,
+) -> EntrySource {
+    if due.attempt >= max_pending_retry_attempts(autoclaim_min_idle_ms, backoff) {
+        EntrySource::Autoclaimed
+    } else {
+        due.entry_source
+    }
+}
+
+fn max_pending_retry_attempts(autoclaim_min_idle_ms: usize, backoff: Duration) -> u32 {
+    let backoff_ms = backoff.as_millis().max(1) as u64;
+    let autoclaim_ms = autoclaim_min_idle_ms as u64;
+    (autoclaim_ms / backoff_ms).max(1) as u32
 }
 
 async fn process_due_pending_retries(
@@ -321,28 +359,34 @@ async fn process_due_pending_retries(
     join_set: &mut JoinSet<()>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
-    let due_messages = {
+    let backoff = pending_retry_backoff_from_env();
+    let due_retries = {
         let scheduler = pending_retries.lock().await;
-        scheduler.due_messages()
+        scheduler.due_retries()
     };
 
-    for message in due_messages {
+    for due_retry in due_retries {
         if shutdown_triggered(shutdown_rx) {
             break;
         }
 
-        pending_retries.lock().await.remove(&message.stream_id);
+        let entry_source =
+            entry_source_for_pending_retry(&due_retry, config.autoclaim_min_idle_ms, backoff);
+        pending_retries
+            .lock()
+            .await
+            .remove(&due_retry.message.stream_id);
         process_message(
             config,
             response_store,
             upstream_http,
-            message,
+            due_retry.message,
             pending_retries.clone(),
             job_concurrency.clone(),
             join_set,
             shutdown_rx,
             None,
-            None,
+            Some(entry_source),
         )
         .await;
     }
@@ -386,8 +430,9 @@ async fn process_message(
                 schedule_message_retry_on_error(
                     &err,
                     &message,
-                    pending_retries.clone(),
+                    &pending_retries,
                     &response_id,
+                    entry_source,
                 )
                 .await
             }
@@ -416,8 +461,9 @@ async fn process_message(
                 schedule_message_retry_on_error(
                     &err,
                     &message,
-                    pending_retries.clone(),
+                    &pending_retries,
                     &response_id,
+                    entry_source,
                 )
                 .await;
             }
@@ -430,14 +476,18 @@ async fn process_message(
 async fn schedule_message_retry_on_error(
     err: &anyhow::Error,
     message: &QueueMessage,
-    pending_retries: Arc<Mutex<PendingRetryScheduler>>,
+    pending_retries: &Arc<Mutex<PendingRetryScheduler>>,
     response_id: &str,
+    entry_source: EntrySource,
 ) {
-    if err.downcast_ref::<RetryableMessageError>().is_some() || is_retryable_store_error(err) {
-        pending_retries
-            .lock()
-            .await
-            .schedule(message, pending_retry_backoff_from_env());
+    if err.downcast_ref::<RetryableMessageError>().is_some()
+        || err.downcast_ref::<RetryableAckError>().is_some()
+    {
+        pending_retries.lock().await.schedule(
+            message,
+            pending_retry_backoff_from_env(),
+            entry_source,
+        );
         return;
     }
 
@@ -446,6 +496,17 @@ async fn schedule_message_retry_on_error(
 
 #[derive(Debug)]
 struct RetryableMessageError;
+
+#[derive(Debug)]
+struct RetryableAckError;
+
+impl std::fmt::Display for RetryableAckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to acknowledge background queue message; will retry")
+    }
+}
+
+impl std::error::Error for RetryableAckError {}
 
 impl std::fmt::Display for RetryableMessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -470,10 +531,15 @@ async fn handle_message(
     match worker::process_response(response_store, upstream_http, &message.response_id, ctx).await?
     {
         ProcessOutcome::Ack => {
-            response_store
+            if let Err(err) = response_store
                 .acknowledge_background_job(&config.consumer_group, &message.stream_id)
                 .await
-                .context("failed to acknowledge background queue message")?;
+            {
+                if is_retryable_store_error(&err) {
+                    return Err(RetryableAckError.into());
+                }
+                return Err(err.context("failed to acknowledge background queue message"));
+            }
         }
         ProcessOutcome::Retry => return Err(RetryableMessageError.into()),
     }
@@ -714,25 +780,75 @@ mod tests {
     #[test]
     fn pending_retry_scheduler_honors_backoff() {
         let mut scheduler = PendingRetryScheduler::new();
-        scheduler.schedule(
-            &QueueMessage {
+        let message = QueueMessage {
+            stream_id: "1-0".to_string(),
+            response_id: "resp_a".to_string(),
+            idle_ms: None,
+            autoclaimed: false,
+        };
+        scheduler.schedule(&message, Duration::from_secs(60), EntrySource::Live);
+        assert!(scheduler.due_retries().is_empty());
+        scheduler.entries.get_mut("1-0").unwrap().retry_at = Instant::now();
+        assert_eq!(
+            scheduler.due_retries(),
+            vec![DuePendingRetry {
+                message: message.clone(),
+                entry_source: EntrySource::Live,
+                attempt: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn pending_retry_scheduler_preserves_entry_source_and_increments_attempts() {
+        let mut scheduler = PendingRetryScheduler::new();
+        let message = QueueMessage {
+            stream_id: "1-0".to_string(),
+            response_id: "resp_a".to_string(),
+            idle_ms: None,
+            autoclaimed: false,
+        };
+        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live);
+        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live);
+        let entry = scheduler.entries.get("1-0").unwrap();
+        assert_eq!(entry.entry_source, EntrySource::Live);
+        assert_eq!(entry.attempt, 2);
+    }
+
+    #[test]
+    fn pending_retry_escalates_to_autoclaimed_after_idle_window() {
+        let due = DuePendingRetry {
+            message: QueueMessage {
                 stream_id: "1-0".to_string(),
                 response_id: "resp_a".to_string(),
                 idle_ms: None,
                 autoclaimed: false,
             },
-            Duration::from_secs(60),
-        );
-        assert!(scheduler.due_messages().is_empty());
-        scheduler.entries.get_mut("1-0").unwrap().retry_at = Instant::now();
+            entry_source: EntrySource::Live,
+            attempt: 24,
+        };
         assert_eq!(
-            scheduler.due_messages(),
-            vec![QueueMessage {
-                stream_id: "1-0".to_string(),
-                response_id: "resp_a".to_string(),
-                idle_ms: None,
-                autoclaimed: false,
-            }]
+            entry_source_for_pending_retry(&due, 720_000, Duration::from_secs(30)),
+            EntrySource::Autoclaimed
+        );
+        assert_eq!(
+            entry_source_for_pending_retry(
+                &DuePendingRetry {
+                    attempt: 23,
+                    ..due.clone()
+                },
+                720_000,
+                Duration::from_secs(30)
+            ),
+            EntrySource::Live
+        );
+    }
+
+    #[test]
+    fn max_pending_retry_attempts_matches_autoclaim_window() {
+        assert_eq!(
+            max_pending_retry_attempts(720_000, Duration::from_secs(30)),
+            24
         );
     }
 }
