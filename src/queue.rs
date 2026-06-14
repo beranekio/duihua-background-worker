@@ -168,6 +168,7 @@ pub async fn run() -> Result<()> {
                         Some(permit),
                         None,
                         None,
+                        false,
                         None,
                     )
                     .await;
@@ -242,6 +243,7 @@ async fn schedule_pending_hydration_retries(
             backoff,
             EntrySource::Live,
             1,
+            true,
             None,
         );
         eprintln!(
@@ -296,6 +298,7 @@ async fn drain_pending_at_startup(
                     None,
                     Some(entry_source),
                     None,
+                    false,
                     None,
                 )
                 .await;
@@ -321,6 +324,7 @@ struct PendingRetryEntry {
     idle_ms: Option<u64>,
     entry_source: EntrySource,
     attempt: u32,
+    pending_hydration: bool,
     pending_completion: Option<StoredResponse>,
 }
 
@@ -329,6 +333,7 @@ struct DuePendingRetry {
     message: QueueMessage,
     entry_source: EntrySource,
     attempt: u32,
+    pending_hydration: bool,
     pending_completion: Option<StoredResponse>,
 }
 
@@ -348,6 +353,7 @@ impl PendingRetryScheduler {
         backoff: Duration,
         entry_source: EntrySource,
         attempt: u32,
+        pending_hydration: bool,
         pending_completion: Option<StoredResponse>,
     ) {
         self.entries.insert(
@@ -359,6 +365,7 @@ impl PendingRetryScheduler {
                 idle_ms: message.idle_ms,
                 entry_source,
                 attempt,
+                pending_hydration,
                 pending_completion,
             },
         );
@@ -382,6 +389,7 @@ impl PendingRetryScheduler {
                 },
                 entry_source: entry.entry_source,
                 attempt: entry.attempt,
+                pending_hydration: entry.pending_hydration,
                 pending_completion: entry.pending_completion.clone(),
             })
             .collect()
@@ -450,6 +458,7 @@ async fn process_due_pending_retries(
             None,
             Some(entry_source),
             Some(due_retry.attempt),
+            due_retry.pending_hydration,
             due_retry.pending_completion,
         )
         .await;
@@ -469,6 +478,7 @@ async fn process_message(
     mut reserved_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     entry_source: Option<EntrySource>,
     retry_attempt: Option<u32>,
+    pending_hydration: bool,
     pending_completion: Option<StoredResponse>,
 ) {
     let response_id = message.response_id.clone();
@@ -489,6 +499,7 @@ async fn process_message(
             upstream_http,
             &message,
             entry_source,
+            pending_hydration,
             pending_completion.as_ref(),
         )
         .await
@@ -522,6 +533,7 @@ async fn process_message(
             &upstream_http,
             &message,
             entry_source,
+            pending_hydration,
             pending_completion.as_ref(),
         )
         .await
@@ -556,15 +568,24 @@ async fn schedule_message_retry_on_error(
         .downcast_ref::<worker::RetryableCompletionError>()
         .map(|err| err.completion.clone());
 
+    let pending_hydration = err.downcast_ref::<worker::RetryableLoadError>().is_some();
+
     if err.downcast_ref::<RetryableMessageError>().is_some()
         || err.downcast_ref::<RetryableAckError>().is_some()
+        || err.downcast_ref::<worker::RetryableLoadError>().is_some()
         || pending_completion.is_some()
     {
+        let backoff = pending_retry_backoff_from_env();
+        eprintln!(
+            "retryable error processing background queue message {response_id}; scheduled retry in {}s: {err:?}",
+            backoff.as_secs()
+        );
         pending_retries.lock().await.schedule(
             message,
-            pending_retry_backoff_from_env(),
+            backoff,
             entry_source,
             attempt,
+            pending_hydration,
             pending_completion,
         );
         return;
@@ -601,6 +622,7 @@ async fn handle_message(
     upstream_http: &HttpClient,
     message: &QueueMessage,
     entry_source: EntrySource,
+    pending_hydration: bool,
     pending_completion: Option<&StoredResponse>,
 ) -> Result<()> {
     if let Some(completion) = pending_completion {
@@ -622,6 +644,7 @@ async fn handle_message(
         message_idle_ms: message.idle_ms,
         autoclaim_min_idle_ms: config.autoclaim_min_idle_ms,
         entry_source,
+        hydration_retry: pending_hydration,
     };
     match worker::process_response(response_store, upstream_http, &message.response_id, ctx).await?
     {
@@ -886,6 +909,7 @@ mod tests {
             Duration::from_secs(60),
             EntrySource::Live,
             1,
+            false,
             None,
         );
         assert!(scheduler.due_retries().is_empty());
@@ -896,6 +920,7 @@ mod tests {
                 message: message.clone(),
                 entry_source: EntrySource::Live,
                 attempt: 1,
+                pending_hydration: false,
                 pending_completion: None,
             }]
         );
@@ -915,6 +940,7 @@ mod tests {
             Duration::from_secs(30),
             EntrySource::Live,
             1,
+            false,
             None,
         );
         scheduler.schedule(
@@ -922,6 +948,7 @@ mod tests {
             Duration::from_secs(30),
             EntrySource::Live,
             2,
+            false,
             None,
         );
         let entry = scheduler.entries.get("1-0").unwrap();
@@ -940,6 +967,7 @@ mod tests {
             },
             entry_source: EntrySource::Live,
             attempt: 24,
+            pending_hydration: false,
             pending_completion: None,
         };
         assert_eq!(
@@ -1002,11 +1030,34 @@ mod tests {
             Duration::from_secs(30),
             EntrySource::Live,
             1,
+            false,
             Some(completion.clone()),
         );
         assert_eq!(
             scheduler.entries.get("2-0").unwrap().pending_completion,
             Some(completion)
         );
+    }
+
+    #[test]
+    fn pending_retry_scheduler_preserves_pending_hydration_flag() {
+        let mut scheduler = PendingRetryScheduler::new();
+        let message = QueueMessage {
+            stream_id: "3-0".to_string(),
+            response_id: "resp_c".to_string(),
+            idle_ms: None,
+            autoclaimed: false,
+        };
+        scheduler.schedule(
+            &message,
+            Duration::from_secs(30),
+            EntrySource::Live,
+            1,
+            true,
+            None,
+        );
+        assert!(scheduler.entries.get("3-0").unwrap().pending_hydration);
+        scheduler.entries.get_mut("3-0").unwrap().retry_at = Instant::now();
+        assert!(scheduler.due_retries()[0].pending_hydration);
     }
 }
