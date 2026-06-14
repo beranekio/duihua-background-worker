@@ -72,6 +72,14 @@ pub fn upstream_http_client() -> Result<HttpClient> {
         .context("failed to build upstream HTTP client")
 }
 
+fn map_hydration_retry_store_error(err: anyhow::Error, hydration_retry: bool) -> anyhow::Error {
+    if hydration_retry && is_retryable_store_error(&err) {
+        RetryableLoadError.into()
+    } else {
+        err
+    }
+}
+
 pub async fn process_response(
     response_store: &StoreHandle,
     http: &HttpClient,
@@ -83,10 +91,7 @@ pub async fn process_response(
     let stored = match response_store.load(response_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Ok(ProcessOutcome::Ack),
-        Err(err) if ctx.hydration_retry && is_retryable_store_error(&err) => {
-            return Err(RetryableLoadError.into());
-        }
-        Err(err) => return Err(err),
+        Err(err) => return Err(map_hydration_retry_store_error(err, ctx.hydration_retry)),
     };
     match pre_claim_action(&stored, ctx) {
         PreClaimAction::Ack => return Ok(ProcessOutcome::Ack),
@@ -103,8 +108,10 @@ pub async fn process_response(
         PreClaimAction::Claim => {}
     }
 
-    let Some(work) = claim_for_processing(response_store, response_id).await? else {
-        return outcome_after_failed_claim(response_store, response_id, ctx).await;
+    let work = match claim_for_processing(response_store, response_id).await {
+        Ok(Some(work)) => work,
+        Ok(None) => return outcome_after_failed_claim(response_store, response_id, ctx).await,
+        Err(err) => return Err(map_hydration_retry_store_error(err, ctx.hydration_retry)),
     };
 
     let url = format!("{}/responses", work.upstream);
@@ -219,8 +226,10 @@ async fn outcome_after_failed_claim(
     response_id: &str,
     ctx: ProcessContext,
 ) -> Result<ProcessOutcome> {
-    let Some(stored) = response_store.load(response_id).await? else {
-        return Ok(ProcessOutcome::Ack);
+    let stored = match response_store.load(response_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(ProcessOutcome::Ack),
+        Err(err) => return Err(map_hydration_retry_store_error(err, ctx.hydration_retry)),
     };
     match pre_claim_action(&stored, ctx) {
         PreClaimAction::Ack => Ok(ProcessOutcome::Ack),
