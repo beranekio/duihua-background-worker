@@ -3,7 +3,7 @@ use std::{env, time::Duration};
 use anyhow::{Context, Result};
 use responses_api_store_client::{stored_response_status, StoredResponse};
 
-use crate::responses_store::StoreHandle;
+use crate::responses_store::{is_retryable_store_error, StoreHandle};
 use reqwest::Client as HttpClient;
 use serde_json::{json, Value};
 
@@ -13,6 +13,19 @@ struct ClaimedWork {
     input: Vec<Value>,
     upstream_authorization: Option<String>,
 }
+
+#[derive(Debug)]
+pub struct RetryableCompletionError {
+    pub completion: StoredResponse,
+}
+
+impl std::fmt::Display for RetryableCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to persist completed background response; will retry")
+    }
+}
+
+impl std::error::Error for RetryableCompletionError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessOutcome {
@@ -123,19 +136,22 @@ pub async fn process_response(
                 }
             };
 
-            store_completion(
-                response_store,
-                response_id,
-                StoredResponse {
-                    upstream: work.upstream,
-                    response,
-                    input: work.input,
-                    pending_upstream_request: None,
-                    upstream_authorization: None,
-                    enqueued_at: None,
-                },
-            )
-            .await?;
+            let completion = StoredResponse {
+                upstream: work.upstream,
+                response,
+                input: work.input,
+                pending_upstream_request: None,
+                upstream_authorization: None,
+                enqueued_at: None,
+            };
+            if let Err(err) =
+                store_completion_with_retry(response_store, response_id, completion.clone()).await
+            {
+                if is_retryable_store_error(&err) {
+                    return Err(RetryableCompletionError { completion }.into());
+                }
+                return Err(err);
+            }
         }
         Err(e) => {
             mark_failed(response_store, response_id, &e.to_string()).await?;
@@ -290,6 +306,45 @@ fn with_response_status(response: &Value, status: &str) -> Value {
 fn merge_completion(current: &StoredResponse, mut completion: StoredResponse) -> StoredResponse {
     completion.enqueued_at = current.enqueued_at;
     completion
+}
+
+const STORE_COMPLETION_MAX_ATTEMPTS: usize = 5;
+
+pub async fn persist_completion_only(
+    response_store: &StoreHandle,
+    response_id: &str,
+    stored: StoredResponse,
+) -> Result<()> {
+    if let Err(err) = store_completion_with_retry(response_store, response_id, stored.clone()).await
+    {
+        if is_retryable_store_error(&err) {
+            return Err(RetryableCompletionError { completion: stored }.into());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn store_completion_with_retry(
+    response_store: &StoreHandle,
+    response_id: &str,
+    stored: StoredResponse,
+) -> Result<()> {
+    let mut backoff = Duration::from_millis(100);
+    for attempt in 0..STORE_COMPLETION_MAX_ATTEMPTS {
+        match store_completion(response_store, response_id, stored.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if is_retryable_store_error(&err)
+                    && attempt + 1 < STORE_COMPLETION_MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 async fn store_completion(

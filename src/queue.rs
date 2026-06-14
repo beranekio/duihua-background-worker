@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use responses_api_store_client::ClaimBackgroundJobsRequest;
+use responses_api_store_client::{ClaimBackgroundJobsRequest, StoredResponse};
 
 use crate::responses_store::{connect_from_env, is_retryable_store_error, StoreHandle};
 use tokio::sync::{watch, Mutex, Semaphore};
@@ -163,6 +163,7 @@ pub async fn run() -> Result<()> {
                     Some(permit),
                     None,
                     None,
+                    None,
                 )
                 .await;
             }
@@ -248,6 +249,7 @@ async fn drain_pending_at_startup(
                     None,
                     Some(entry_source),
                     None,
+                    None,
                 )
                 .await;
 
@@ -273,13 +275,15 @@ struct PendingRetryEntry {
     idle_ms: Option<u64>,
     entry_source: EntrySource,
     attempt: u32,
+    pending_completion: Option<StoredResponse>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct DuePendingRetry {
     message: QueueMessage,
     entry_source: EntrySource,
     attempt: u32,
+    pending_completion: Option<StoredResponse>,
 }
 
 #[derive(Debug, Default)]
@@ -298,6 +302,7 @@ impl PendingRetryScheduler {
         backoff: Duration,
         entry_source: EntrySource,
         attempt: u32,
+        pending_completion: Option<StoredResponse>,
     ) {
         self.entries.insert(
             message.stream_id.clone(),
@@ -308,6 +313,7 @@ impl PendingRetryScheduler {
                 idle_ms: message.idle_ms,
                 entry_source,
                 attempt,
+                pending_completion,
             },
         );
     }
@@ -330,6 +336,7 @@ impl PendingRetryScheduler {
                 },
                 entry_source: entry.entry_source,
                 attempt: entry.attempt,
+                pending_completion: entry.pending_completion.clone(),
             })
             .collect()
     }
@@ -397,6 +404,7 @@ async fn process_due_pending_retries(
             None,
             Some(entry_source),
             Some(due_retry.attempt),
+            due_retry.pending_completion,
         )
         .await;
     }
@@ -415,6 +423,7 @@ async fn process_message(
     mut reserved_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     entry_source: Option<EntrySource>,
     retry_attempt: Option<u32>,
+    pending_completion: Option<StoredResponse>,
 ) {
     let response_id = message.response_id.clone();
     let entry_source = entry_source.unwrap_or_else(|| entry_source_for_message(&message, false));
@@ -434,6 +443,7 @@ async fn process_message(
             upstream_http,
             &message,
             entry_source,
+            pending_completion.as_ref(),
         )
         .await
         {
@@ -466,6 +476,7 @@ async fn process_message(
             &upstream_http,
             &message,
             entry_source,
+            pending_completion.as_ref(),
         )
         .await
         {
@@ -495,14 +506,20 @@ async fn schedule_message_retry_on_error(
     entry_source: EntrySource,
     attempt: u32,
 ) {
+    let pending_completion = err
+        .downcast_ref::<worker::RetryableCompletionError>()
+        .map(|err| err.completion.clone());
+
     if err.downcast_ref::<RetryableMessageError>().is_some()
         || err.downcast_ref::<RetryableAckError>().is_some()
+        || pending_completion.is_some()
     {
         pending_retries.lock().await.schedule(
             message,
             pending_retry_backoff_from_env(),
             entry_source,
             attempt,
+            pending_completion,
         );
         return;
     }
@@ -538,7 +555,23 @@ async fn handle_message(
     upstream_http: &HttpClient,
     message: &QueueMessage,
     entry_source: EntrySource,
+    pending_completion: Option<&StoredResponse>,
 ) -> Result<()> {
+    if let Some(completion) = pending_completion {
+        worker::persist_completion_only(response_store, &message.response_id, completion.clone())
+            .await?;
+        if let Err(err) = response_store
+            .acknowledge_background_job(&config.consumer_group, &message.stream_id)
+            .await
+        {
+            if is_retryable_store_error(&err) {
+                return Err(RetryableAckError.into());
+            }
+            return Err(err.context("failed to acknowledge background queue message"));
+        }
+        return Ok(());
+    }
+
     let ctx = ProcessContext {
         message_idle_ms: message.idle_ms,
         autoclaim_min_idle_ms: config.autoclaim_min_idle_ms,
@@ -802,7 +835,13 @@ mod tests {
             idle_ms: None,
             autoclaimed: false,
         };
-        scheduler.schedule(&message, Duration::from_secs(60), EntrySource::Live, 1);
+        scheduler.schedule(
+            &message,
+            Duration::from_secs(60),
+            EntrySource::Live,
+            1,
+            None,
+        );
         assert!(scheduler.due_retries().is_empty());
         scheduler.entries.get_mut("1-0").unwrap().retry_at = Instant::now();
         assert_eq!(
@@ -811,6 +850,7 @@ mod tests {
                 message: message.clone(),
                 entry_source: EntrySource::Live,
                 attempt: 1,
+                pending_completion: None,
             }]
         );
     }
@@ -824,8 +864,20 @@ mod tests {
             idle_ms: None,
             autoclaimed: false,
         };
-        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live, 1);
-        scheduler.schedule(&message, Duration::from_secs(30), EntrySource::Live, 2);
+        scheduler.schedule(
+            &message,
+            Duration::from_secs(30),
+            EntrySource::Live,
+            1,
+            None,
+        );
+        scheduler.schedule(
+            &message,
+            Duration::from_secs(30),
+            EntrySource::Live,
+            2,
+            None,
+        );
         let entry = scheduler.entries.get("1-0").unwrap();
         assert_eq!(entry.entry_source, EntrySource::Live);
         assert_eq!(entry.attempt, 2);
@@ -842,6 +894,7 @@ mod tests {
             },
             entry_source: EntrySource::Live,
             attempt: 24,
+            pending_completion: None,
         };
         assert_eq!(
             entry_source_for_pending_retry(&due, 720_000, Duration::from_secs(30)),
@@ -880,5 +933,34 @@ mod tests {
     fn next_retry_attempt_increments_from_due_retry() {
         assert_eq!(next_retry_attempt(None), 1);
         assert_eq!(next_retry_attempt(Some(3)), 4);
+    }
+
+    #[test]
+    fn pending_retry_scheduler_retains_completion_payload() {
+        let mut scheduler = PendingRetryScheduler::new();
+        let completion = StoredResponse {
+            upstream: "http://model".to_string(),
+            response: serde_json::json!({"status": "completed", "background": true}),
+            input: vec![],
+            pending_upstream_request: None,
+            upstream_authorization: None,
+            enqueued_at: None,
+        };
+        scheduler.schedule(
+            &QueueMessage {
+                stream_id: "2-0".to_string(),
+                response_id: "resp_b".to_string(),
+                idle_ms: None,
+                autoclaimed: false,
+            },
+            Duration::from_secs(30),
+            EntrySource::Live,
+            1,
+            Some(completion.clone()),
+        );
+        assert_eq!(
+            scheduler.entries.get("2-0").unwrap().pending_completion,
+            Some(completion)
+        );
     }
 }
