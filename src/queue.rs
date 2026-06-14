@@ -382,13 +382,15 @@ async fn process_message(
         .await
         {
             Ok(()) => {}
-            Err(err) => schedule_message_retry_on_error(
-                &err,
-                &message,
-                pending_retries.clone(),
-                &response_id,
-            )
-            .await,
+            Err(err) => {
+                schedule_message_retry_on_error(
+                    &err,
+                    &message,
+                    pending_retries.clone(),
+                    &response_id,
+                )
+                .await
+            }
         }
         drop(permit);
         return;

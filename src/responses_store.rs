@@ -115,9 +115,9 @@ fn is_retryable_client_error(err: &ClientError) -> bool {
     match err {
         ClientError::Transport(_) => true,
         ClientError::Rpc(status) => is_retryable_rpc_status(status.code()),
-        ClientError::Serialization(_) | ClientError::NotFound(_) | ClientError::Configuration(_) => {
-            false
-        }
+        ClientError::Serialization(_)
+        | ClientError::NotFound(_)
+        | ClientError::Configuration(_) => false,
     }
 }
 
@@ -152,8 +152,7 @@ mod retryable_error_tests {
 
     #[test]
     fn serialization_errors_are_not_retryable() {
-        let err: anyhow::Error =
-            ClientError::Serialization("invalid record".to_string()).into();
+        let err: anyhow::Error = ClientError::Serialization("invalid record".to_string()).into();
         assert!(!is_retryable_store_error(&err));
     }
 }
