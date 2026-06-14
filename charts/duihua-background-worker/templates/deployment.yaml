@@ -50,7 +50,14 @@ spec:
               value: {{ .Values.maxConcurrentJobs | quote }}
             - name: BACKGROUND_UPSTREAM_TIMEOUT_SECONDS
               value: {{ .Values.upstreamTimeoutSeconds | quote }}
-            {{- if .Values.upstreamApiKey }}
+            {{- $secret := .Values.upstreamApiKeySecret | default dict }}
+            {{- if $secret.name }}
+            - name: UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret.name | quote }}
+                  key: {{ required "upstreamApiKeySecret.key is required when upstreamApiKeySecret.name is set" $secret.key | quote }}
+            {{- else if .Values.upstreamApiKey }}
             - name: UPSTREAM_API_KEY
               value: {{ .Values.upstreamApiKey | quote }}
             {{- end }}

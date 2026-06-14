@@ -41,6 +41,8 @@ background worker startup: recommended terminationGracePeriodSeconds=<n>
 | `BACKGROUND_UPSTREAM_TIMEOUT_SECONDS` | `600` | Upstream HTTP timeout |
 | `UPSTREAM_API_KEY` | (none) | Optional bearer token for upstream |
 
+In Kubernetes, prefer Helm `upstreamApiKeySecret` (`secretKeyRef`) over inline `upstreamApiKey` values.
+
 `terminationGracePeriodSeconds` in Helm should exceed `BACKGROUND_UPSTREAM_TIMEOUT_SECONDS + blockMs/1000 + 60`. The worker logs the recommended value at startup.
 
 ## Local development
@@ -81,6 +83,14 @@ helm upgrade --install duihua-background-worker charts/duihua-background-worker 
   --namespace duihua \
   --create-namespace \
   --set responsesApiStore.endpoint=http://responses-api-store:50051
+```
+
+Production upstream API key via Secret:
+
+```yaml
+upstreamApiKeySecret:
+  name: upstream-api-key
+  key: api-key
 ```
 
 With KEDA autoscaling via store metrics:
