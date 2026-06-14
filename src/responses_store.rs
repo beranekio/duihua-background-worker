@@ -6,7 +6,7 @@ use responses_api_store_client::{
 };
 use tonic::{
     transport::{Channel, Endpoint},
-    Code,
+    Code, Status,
 };
 
 #[derive(Clone)]
@@ -92,4 +92,68 @@ impl StoreHandle {
 
 fn map_client_error(err: ClientError) -> anyhow::Error {
     err.into()
+}
+
+pub fn is_retryable_store_error(err: &anyhow::Error) -> bool {
+    if let Some(err) = err.downcast_ref::<ClientError>() {
+        return is_retryable_client_error(err);
+    }
+
+    for cause in err.chain() {
+        if let Some(err) = cause.downcast_ref::<ClientError>() {
+            return is_retryable_client_error(err);
+        }
+        if let Some(status) = cause.downcast_ref::<Status>() {
+            return is_retryable_rpc_status(status.code());
+        }
+    }
+
+    false
+}
+
+fn is_retryable_client_error(err: &ClientError) -> bool {
+    match err {
+        ClientError::Transport(_) => true,
+        ClientError::Rpc(status) => is_retryable_rpc_status(status.code()),
+        ClientError::Serialization(_) | ClientError::NotFound(_) | ClientError::Configuration(_) => {
+            false
+        }
+    }
+}
+
+fn is_retryable_rpc_status(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+            | Code::Aborted
+            | Code::Internal
+            | Code::Unknown
+    )
+}
+
+#[cfg(test)]
+mod retryable_error_tests {
+    use super::*;
+    use tonic::Status;
+
+    #[test]
+    fn unavailable_rpc_errors_are_retryable() {
+        let err: anyhow::Error = ClientError::Rpc(Status::unavailable("store down")).into();
+        assert!(is_retryable_store_error(&err));
+    }
+
+    #[test]
+    fn not_found_errors_are_not_retryable() {
+        let err: anyhow::Error = ClientError::NotFound("resp_1".to_string()).into();
+        assert!(!is_retryable_store_error(&err));
+    }
+
+    #[test]
+    fn serialization_errors_are_not_retryable() {
+        let err: anyhow::Error =
+            ClientError::Serialization("invalid record".to_string()).into();
+        assert!(!is_retryable_store_error(&err));
+    }
 }

@@ -8,7 +8,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use responses_api_store_client::ClaimBackgroundJobsRequest;
 
-use crate::responses_store::{connect_from_env, StoreHandle};
+use crate::responses_store::{connect_from_env, is_retryable_store_error, StoreHandle};
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
@@ -382,15 +382,13 @@ async fn process_message(
         .await
         {
             Ok(()) => {}
-            Err(err) if err.downcast_ref::<RetryableMessageError>().is_some() => {
-                pending_retries
-                    .lock()
-                    .await
-                    .schedule(&message, pending_retry_backoff_from_env());
-            }
-            Err(err) => {
-                eprintln!("failed to process background queue message {response_id}: {err:?}");
-            }
+            Err(err) => schedule_message_retry_on_error(
+                &err,
+                &message,
+                pending_retries.clone(),
+                &response_id,
+            )
+            .await,
         }
         drop(permit);
         return;
@@ -412,19 +410,36 @@ async fn process_message(
         .await
         {
             Ok(()) => {}
-            Err(err) if err.downcast_ref::<RetryableMessageError>().is_some() => {
-                pending_retries
-                    .lock()
-                    .await
-                    .schedule(&message, pending_retry_backoff_from_env());
-            }
             Err(err) => {
-                eprintln!("failed to process background queue message {response_id}: {err:?}");
+                schedule_message_retry_on_error(
+                    &err,
+                    &message,
+                    pending_retries.clone(),
+                    &response_id,
+                )
+                .await;
             }
         }
     });
 
     drop(reserved_permit);
+}
+
+async fn schedule_message_retry_on_error(
+    err: &anyhow::Error,
+    message: &QueueMessage,
+    pending_retries: Arc<Mutex<PendingRetryScheduler>>,
+    response_id: &str,
+) {
+    if err.downcast_ref::<RetryableMessageError>().is_some() || is_retryable_store_error(err) {
+        pending_retries
+            .lock()
+            .await
+            .schedule(message, pending_retry_backoff_from_env());
+        return;
+    }
+
+    eprintln!("failed to process background queue message {response_id}: {err:?}");
 }
 
 #[derive(Debug)]
