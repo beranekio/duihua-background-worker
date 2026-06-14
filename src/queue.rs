@@ -6,7 +6,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use responses_api_store_client::{ClaimBackgroundJobsRequest, StoredResponse};
+use responses_api_store_client::{
+    ClaimBackgroundJobsRequest, PendingBackgroundJob, StoredResponse,
+};
 
 use crate::responses_store::{connect_from_env, is_retryable_store_error, StoreHandle};
 use tokio::sync::{watch, Mutex, Semaphore};
@@ -150,24 +152,29 @@ pub async fn run() -> Result<()> {
         }
 
         match claim_jobs(&response_store, &config, 1, config.block_ms as u32).await {
-            Ok(Some(message)) => {
-                process_message(
-                    &config,
-                    &response_store,
-                    &upstream_http,
-                    message,
-                    pending_retries.clone(),
-                    job_concurrency.clone(),
-                    &mut join_set,
-                    &shutdown_rx,
-                    Some(permit),
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+            Ok(claimed) => {
+                schedule_pending_hydration_retries(claimed.pending_jobs, pending_retries.clone())
+                    .await;
+                if let Some(message) = claimed.job {
+                    process_message(
+                        &config,
+                        &response_store,
+                        &upstream_http,
+                        message,
+                        pending_retries.clone(),
+                        job_concurrency.clone(),
+                        &mut join_set,
+                        &shutdown_rx,
+                        Some(permit),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                } else {
+                    drop(permit);
+                }
             }
-            Ok(None) => drop(permit),
             Err(err) => {
                 drop(permit);
                 eprintln!("failed to claim background queue jobs: {err:?}");
@@ -182,12 +189,17 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+struct ClaimJobsResult {
+    job: Option<QueueMessage>,
+    pending_jobs: Vec<PendingBackgroundJob>,
+}
+
 async fn claim_jobs(
     response_store: &StoreHandle,
     config: &QueueConfig,
     count: u32,
     block_ms: u32,
-) -> Result<Option<QueueMessage>> {
+) -> Result<ClaimJobsResult> {
     let result = response_store
         .claim_background_jobs(ClaimBackgroundJobsRequest {
             consumer_group: config.consumer_group.clone(),
@@ -198,16 +210,46 @@ async fn claim_jobs(
         })
         .await?;
 
-    for stream_id in result.pending_stream_ids {
-        eprintln!("background queue entry {stream_id} pending hydration; leaving in PEL");
+    Ok(ClaimJobsResult {
+        job: result.jobs.into_iter().next().map(|job| QueueMessage {
+            stream_id: job.stream_id,
+            response_id: job.response_id,
+            idle_ms: job.idle_ms,
+            autoclaimed: job.autoclaimed,
+        }),
+        pending_jobs: result.pending_jobs,
+    })
+}
+
+async fn schedule_pending_hydration_retries(
+    pending_jobs: Vec<PendingBackgroundJob>,
+    pending_retries: Arc<Mutex<PendingRetryScheduler>>,
+) {
+    if pending_jobs.is_empty() {
+        return;
     }
 
-    Ok(result.jobs.into_iter().next().map(|job| QueueMessage {
-        stream_id: job.stream_id,
-        response_id: job.response_id,
-        idle_ms: job.idle_ms,
-        autoclaimed: job.autoclaimed,
-    }))
+    let backoff = pending_retry_backoff_from_env();
+    let mut scheduler = pending_retries.lock().await;
+    for pending in pending_jobs {
+        scheduler.schedule(
+            &QueueMessage {
+                stream_id: pending.stream_id.clone(),
+                response_id: pending.response_id.clone(),
+                idle_ms: None,
+                autoclaimed: false,
+            },
+            backoff,
+            EntrySource::Live,
+            1,
+            None,
+        );
+        eprintln!(
+            "background queue entry {} pending hydration; scheduled retry in {}s",
+            pending.stream_id,
+            backoff.as_secs()
+        );
+    }
 }
 
 fn entry_source_for_message(message: &QueueMessage, startup_pending: bool) -> EntrySource {
@@ -235,7 +277,12 @@ async fn drain_pending_at_startup(
         }
 
         match claim_jobs(response_store, config, 1, 0).await {
-            Ok(Some(message)) => {
+            Ok(claimed) => {
+                schedule_pending_hydration_retries(claimed.pending_jobs, pending_retries.clone())
+                    .await;
+                let Some(message) = claimed.job else {
+                    break;
+                };
                 let entry_source = entry_source_for_message(&message, message.autoclaimed);
                 process_message(
                     config,
@@ -257,7 +304,6 @@ async fn drain_pending_at_startup(
                     break;
                 }
             }
-            Ok(None) => break,
             Err(err) => {
                 eprintln!("failed to drain pending background queue messages at startup: {err:?}");
                 sleep_on_store_error().await;
