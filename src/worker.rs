@@ -19,6 +19,9 @@ pub struct RetryableCompletionError {
     pub completion: StoredResponse,
 }
 
+#[derive(Debug)]
+pub struct RetryableLoadError;
+
 impl std::fmt::Display for RetryableCompletionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("failed to persist completed background response; will retry")
@@ -26,6 +29,14 @@ impl std::fmt::Display for RetryableCompletionError {
 }
 
 impl std::error::Error for RetryableCompletionError {}
+
+impl std::fmt::Display for RetryableLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to load background response for hydration retry; will retry")
+    }
+}
+
+impl std::error::Error for RetryableLoadError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessOutcome {
@@ -51,6 +62,7 @@ pub struct ProcessContext {
     pub message_idle_ms: Option<u64>,
     pub autoclaim_min_idle_ms: usize,
     pub entry_source: EntrySource,
+    pub hydration_retry: bool,
 }
 
 pub fn upstream_http_client() -> Result<HttpClient> {
@@ -58,6 +70,14 @@ pub fn upstream_http_client() -> Result<HttpClient> {
         .timeout(upstream_timeout_from_env())
         .build()
         .context("failed to build upstream HTTP client")
+}
+
+fn map_hydration_retry_store_error(err: anyhow::Error, hydration_retry: bool) -> anyhow::Error {
+    if hydration_retry && is_retryable_store_error(&err) {
+        RetryableLoadError.into()
+    } else {
+        err
+    }
 }
 
 pub async fn process_response(
@@ -68,8 +88,10 @@ pub async fn process_response(
 ) -> Result<ProcessOutcome> {
     let upstream_api_key = env::var("UPSTREAM_API_KEY").ok();
 
-    let Some(stored) = response_store.load(response_id).await? else {
-        return Ok(ProcessOutcome::Ack);
+    let stored = match response_store.load(response_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(ProcessOutcome::Ack),
+        Err(err) => return Err(map_hydration_retry_store_error(err, ctx.hydration_retry)),
     };
     match pre_claim_action(&stored, ctx) {
         PreClaimAction::Ack => return Ok(ProcessOutcome::Ack),
@@ -86,8 +108,10 @@ pub async fn process_response(
         PreClaimAction::Claim => {}
     }
 
-    let Some(work) = claim_for_processing(response_store, response_id).await? else {
-        return outcome_after_failed_claim(response_store, response_id, ctx).await;
+    let work = match claim_for_processing(response_store, response_id).await {
+        Ok(Some(work)) => work,
+        Ok(None) => return outcome_after_failed_claim(response_store, response_id, ctx).await,
+        Err(err) => return Err(map_hydration_retry_store_error(err, ctx.hydration_retry)),
     };
 
     let url = format!("{}/responses", work.upstream);
@@ -202,8 +226,10 @@ async fn outcome_after_failed_claim(
     response_id: &str,
     ctx: ProcessContext,
 ) -> Result<ProcessOutcome> {
-    let Some(stored) = response_store.load(response_id).await? else {
-        return Ok(ProcessOutcome::Ack);
+    let stored = match response_store.load(response_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(ProcessOutcome::Ack),
+        Err(err) => return Err(map_hydration_retry_store_error(err, ctx.hydration_retry)),
     };
     match pre_claim_action(&stored, ctx) {
         PreClaimAction::Ack => Ok(ProcessOutcome::Ack),
@@ -453,6 +479,7 @@ mod tests {
             message_idle_ms: None,
             autoclaim_min_idle_ms: 720_000,
             entry_source: EntrySource::Autoclaimed,
+            hydration_retry: false,
         };
         assert_eq!(
             pre_claim_action(&interrupted, ctx),
@@ -474,6 +501,7 @@ mod tests {
             message_idle_ms: None,
             autoclaim_min_idle_ms: 720_000,
             entry_source: EntrySource::StartupPending,
+            hydration_retry: false,
         };
         assert_eq!(
             pre_claim_action(&interrupted, ctx),
@@ -495,6 +523,7 @@ mod tests {
             message_idle_ms: Some(30_000),
             autoclaim_min_idle_ms: 720_000,
             entry_source: EntrySource::Live,
+            hydration_retry: false,
         };
         assert_eq!(pre_claim_action(&interrupted, ctx), PreClaimAction::Retry);
     }
