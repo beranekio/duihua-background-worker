@@ -1357,7 +1357,7 @@ dependencies = [
 [[package]]
 name = "responses-api-store-client"
 version = "0.1.0"
-source = "git+https://github.com/beranekio/responses-api-store?branch=main#8153c7359b2c1a55cc70bc85989ac1ddbc123a39"
+source = "git+https://github.com/beranekio/responses-api-store?branch=main#39162087bd95813864cda274b2f72e39e6f18001"
 dependencies = [
  "responses-api-store-core",
  "responses-api-store-proto",
@@ -1371,7 +1371,7 @@ dependencies = [
 [[package]]
 name = "responses-api-store-core"
 version = "0.1.0"
-source = "git+https://github.com/beranekio/responses-api-store?branch=main#8153c7359b2c1a55cc70bc85989ac1ddbc123a39"
+source = "git+https://github.com/beranekio/responses-api-store?branch=main#39162087bd95813864cda274b2f72e39e6f18001"
 dependencies = [
  "anyhow",
  "redis",
@@ -1386,7 +1386,7 @@ dependencies = [
 [[package]]
 name = "responses-api-store-proto"
 version = "0.1.0"
-source = "git+https://github.com/beranekio/responses-api-store?branch=main#8153c7359b2c1a55cc70bc85989ac1ddbc123a39"
+source = "git+https://github.com/beranekio/responses-api-store?branch=main#39162087bd95813864cda274b2f72e39e6f18001"
 dependencies = [
  "prost",
  "prost-types",
