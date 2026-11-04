@@ -6,8 +6,16 @@ on:
     types: [completed]
     branches: [main]
 
+# One concurrency group per validated commit. A single shared group is not a
+# queue: GitHub keeps at most one pending run per group and a newly queued run
+# cancels the pending one even with cancel-in-progress: false. Because Validate
+# runs for back-to-back pushes finish out of order, an older commit's Publish
+# could displace the newest commit's pending run, leaving main unpublished.
+# Keying the group to the SHA means distinct commits never cancel each other;
+# re-runs of the same commit still serialize. SHA-tagged image and chart
+# pushes are idempotent, so parallel runs for different commits cannot clash.
 concurrency:
-  group: publish-main
+  group: publish-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 permissions:
@@ -23,12 +31,6 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
     steps:
-      - name: Checkout main
-        uses: actions/checkout@v7
-        with:
-          ref: main
-          fetch-depth: 1
-
       - name: Download image artifact
         uses: actions/download-artifact@v8
         with:
@@ -46,22 +48,76 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push image tags
+      - name: Push SHA image tag
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           GIT_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
+          set -euo pipefail
           docker tag duihua-background-worker:ci "${IMAGE}:${GIT_SHA}"
           docker push "${IMAGE}:${GIT_SHA}"
 
-          git fetch origin main
-          main_sha="$(git rev-parse origin/main)"
-          if [ "${GIT_SHA}" = "${main_sha}" ]; then
-            docker tag duihua-background-worker:ci "${IMAGE}:latest"
-            docker push "${IMAGE}:latest"
-          else
-            echo "Skipping latest tag: ${GIT_SHA} is no longer main head (${main_sha})"
+  promote-latest:
+    name: Move latest image tag to main head
+    runs-on: ubuntu-latest
+    needs: publish-image
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    # Serialize every write to :latest. Whichever run executes last promotes the
+    # *current* main head (not its own commit), so :latest only moves forward
+    # and converges on main even if a pending promotion was replaced.
+    concurrency:
+      group: publish-latest-image
+      cancel-in-progress: false
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point latest at main head image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          GIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/${REPO}/commits/main" --jq .sha)"
+
+          if [ "${main_sha}" != "${GIT_SHA}" ]; then
+            # Another commit is main head. Promote it only if its image is
+            # confirmed present; skip only on a confirmed missing manifest
+            # (that commit's own Publish run will promote it) and fail on any
+            # other inspection error so :latest is never left stale silently.
+            attempt=1
+            while :; do
+              if out="$(docker buildx imagetools inspect "${IMAGE}:${main_sha}" 2>&1)"; then
+                break
+              fi
+              if printf '%s' "${out}" | grep -qiE 'not found|manifest unknown'; then
+                echo "Image for main head ${main_sha} not published yet; its own Publish run will promote it."
+                exit 0
+              fi
+              if [ "${attempt}" -ge 5 ]; then
+                echo "::error::Failed to inspect ${IMAGE}:${main_sha} after ${attempt} attempts:"
+                printf '%s\n' "${out}"
+                exit 1
+              fi
+              echo "Inspect attempt ${attempt} failed, retrying:"
+              printf '%s\n' "${out}"
+              attempt=$((attempt + 1))
+              sleep $((attempt * 5))
+            done
           fi
+
+          # Either this run's own commit (pushed by publish-image) or a
+          # confirmed-present newer main head.
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${main_sha}"
+          echo "latest -> ${IMAGE}:${main_sha}"
 
   publish-chart:
     name: Publish Helm chart
