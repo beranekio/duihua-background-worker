@@ -83,13 +83,39 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          GIT_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           main_sha="$(gh api "repos/${REPO}/commits/main" --jq .sha)"
-          if ! docker buildx imagetools inspect "${IMAGE}:${main_sha}" >/dev/null 2>&1; then
-            echo "Image for main head ${main_sha} not published yet; its own Publish run will promote it."
-            exit 0
+
+          if [ "${main_sha}" != "${GIT_SHA}" ]; then
+            # Another commit is main head. Promote it only if its image is
+            # confirmed present; skip only on a confirmed missing manifest
+            # (that commit's own Publish run will promote it) and fail on any
+            # other inspection error so :latest is never left stale silently.
+            attempt=1
+            while :; do
+              if out="$(docker buildx imagetools inspect "${IMAGE}:${main_sha}" 2>&1)"; then
+                break
+              fi
+              if printf '%s' "${out}" | grep -qiE 'not found|manifest unknown'; then
+                echo "Image for main head ${main_sha} not published yet; its own Publish run will promote it."
+                exit 0
+              fi
+              if [ "${attempt}" -ge 5 ]; then
+                echo "::error::Failed to inspect ${IMAGE}:${main_sha} after ${attempt} attempts:"
+                printf '%s\n' "${out}"
+                exit 1
+              fi
+              echo "Inspect attempt ${attempt} failed, retrying:"
+              printf '%s\n' "${out}"
+              attempt=$((attempt + 1))
+              sleep $((attempt * 5))
+            done
           fi
+
+          # Either this run's own commit (pushed by publish-image) or a
+          # confirmed-present newer main head.
           docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${main_sha}"
           echo "latest -> ${IMAGE}:${main_sha}"
 
